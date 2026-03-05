@@ -19,4 +19,4 @@ for i in data["Expression"] :
     data["Result"].append(x*y);
 
 df = pandas.DataFrame(data);
-df.to_csv("products.csv", index = False)
+df.to_csv("2-digit-products.csv", index = False)
