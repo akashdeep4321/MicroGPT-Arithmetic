@@ -1,6 +1,8 @@
 import random
 import pandas
 
+random.seed(42)
+
 data = {"Expression" : [], "Result" : []}
 
 for i in range(100):
@@ -18,5 +20,13 @@ for i in data["Expression"] :
     y = int(y);
     data["Result"].append(x*y);
 
-df = pandas.DataFrame(data);
-df.to_csv("2-digit-products.csv", index = False)
+train = {"Expression" : data["Expression"][:len(data["Expression"])//2], "Result" : data["Result"][:len(data["Result"])//2]};
+test = {"Expression" : data["Expression"][len(data["Expression"])//2:], "Result" : data["Result"][len(data["Result"])//2:]};
+
+df = pandas.DataFrame(train);
+df.to_csv("2-digit-products-train.csv", index = False)
+
+dff = pandas.DataFrame(test);
+dff.to_csv("2-digit-products-test.csv", index = False)
+
+    
