@@ -194,10 +194,10 @@ for step in tqdm(range(num_steps)):
         p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
         p.grad = 0
     Loss += loss.data
-    if (step+1)%2 == 0:
-        tqdm.write(f"Batch {((step+1)//2):4d} / {((num_steps//2)+1):4d} | loss {(Loss/2):.4f}", end='\r')
+    if (step+1)%32 == 0:
+        tqdm.write(f"Batch {((step+1)//32):4d} / {((num_steps//32)+1):4d} | loss {(Loss/32):.4f}", end='\r')
         Loss = 0
     elif (step == num_steps-1):
-        tqdm.write(f"Batch {(((step+1)//2)+1):4d} / {((num_steps//2)+1):4d} | loss {(Loss/(num_steps%2)):.4f}", end='\r')
+        tqdm.write(f"Batch {(((step+1)//32)+1):4d} / {((num_steps//32)+1):4d} | loss {(Loss/(num_steps%32)):.4f}", end='\r')
         Loss = 0
 
