@@ -19,7 +19,7 @@ for i in range(0,100):
             y = '0' + y
         x = x[::-1]
         y = y[::-1]
-        s += (x + '*' + y + ':')
+        s += (x + '*' + y)
         dataset["Expression"].append(s);
         s = "";
         K=0
