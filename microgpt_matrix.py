@@ -139,39 +139,28 @@ def gpt(tokens, token_positions):
         
         X_attn = []
         
-        # Process each row (token position) separately
-        for i in range(n_k):
-            head_outputs = []
-            
-            for h in range(n_head):
-                hs = h * head_dim
+        for h in range(n_head):
+            hs = h * head_dim
                 
-                # Extract per-head matrices (Equation 9)
-                Q_h = Q[i][hs:hs+head_dim]  # Query for position i, head h
-                K_h = [K[t][hs:hs+head_dim] for t in range(i+1)]  # Keys for positions 0..i, head h (causal)
-                V_h = [V[t][hs:hs+head_dim] for t in range(i+1)]  # Values for positions 0..i, head h (causal)
+            # Extract per-head matrices (Equation 9)
+            Q_h = [Q[t][hs:hs+head_dim] for t in range(n_k)]  # Query for position i, head h
+            K_h = [K[t][hs:hs+head_dim] for t in range(n_k)]  # Keys for positions 0..i, head h (causal)
+            V_h = [V[t][hs:hs+head_dim] for t in range(n_k)]  # Values for positions 0..i, head h (causal)
                 
-                # Compute attention logits for this head (Equation 10 - only past and current tokens)
-                # A_h = softmax(Q_h @ K_h^T / sqrt(d_h))
-                attn_logits = []
-                for t in range(i+1):
-                    # Dot product: Q_h · K_t^T with scaling
-                    score = sum(Q_h[j] * K_h[t][j] for j in range(head_dim)) / (head_dim ** 0.5)
-                    attn_logits.append(score)
+            # Compute attention logits for this head (Equation 10 - only past and current tokens)
+            # A_h = softmax(Q_h @ K_h^T / sqrt(d_h))
+            # Dot product: Q_h · K_t^T with scaling
+            attn_logits = [[sum(Q_h[i][j] * K_h[t][j] for j in range(head_dim)) / (head_dim ** 0.5) for t in range(n_k)] for i in range(n_k)]
+            for i in range(n_k):
+                for j in range(i+1,n_k):
+                   attn_logits[i][j] = -1e9 # Masking Step
+            # Apply softmax to get attention weights
+            attn_weights = [softmax(attn_logits[i]) for i in range(n_k)]
                 
-                # Apply softmax to get attention weights
-                attn_weights = softmax(attn_logits)
-                
-                # Compute per-head output (Equation 12): O_h = A_h @ V_h
-                head_out = []
-                for j in range(head_dim):
-                    val = sum(attn_weights[t] * V_h[t][j] for t in range(i+1))
-                    head_out.append(val)
-                
-                head_outputs.extend(head_out)
-            
-            # Concatenate all heads (Equation 13)
-            X_attn.append(head_outputs)
+            # Compute per-head output (Equation 12): O_h = A_h @ V_h
+            head_out = [[sum(attn_weights[i][t] * V_h[t][j] for t in range(n_k)) for j in range(head_dim)] for i in range(n_k)]
+            for i in range(n_k):
+                X_attn[i].extend(head_out[i])
         
         # Apply output projection and residual connection (Equation 14)
         X = [linear(x_attn, state_dict[f'layer{li}.attn_wo']) for x_attn in X_attn]
@@ -186,7 +175,7 @@ def gpt(tokens, token_positions):
         X = [[a + b for a, b in zip(x, x_res)] for x, x_res in zip(X, X_residual)]
     
     # Return logits for the last token position
-    logits = linear(X[-1], state_dict['lm_head'])
+    logits = [linear(X[i], state_dict['lm_head']) for i in range(n_k)]
     return logits
 
 # Let there be Adam, the blessed optimizer and its buffers
@@ -205,14 +194,11 @@ for step in range(num_steps):
 
     # Forward the token sequence through the model, building up the computation graph all the way to the loss
     losses = []
+    logits = gpt(tokens, list(range(n+1)
     for i in range(n):
-        # Use tokens and positions up to position i (including i)
-        input_tokens = tokens[:i+1]
-        input_positions = list(range(i+1))
         target_id = tokens[i+1]
-        
-        logits = gpt(input_tokens, input_positions)
-        probs = softmax(logits)
+
+        probs = softmax(logits[i+1])
         loss_t = -probs[target_id].log()
         losses.append(loss_t)
     loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
