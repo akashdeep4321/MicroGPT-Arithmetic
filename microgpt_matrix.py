@@ -131,13 +131,14 @@ def gpt(tokens, token_positions):
         # 1) Multi-head Attention block - full matrix view
         X_residual = X
         X = [rmsnorm(x) for x in X]  # Apply RMSNorm to each row
-        
+        #print("X_Norm");
+        #print(X);
         # Compute full Q, K, V matrices (Equation 8)
         Q = [linear(x, state_dict[f'layer{li}.attn_wq']) for x in X]  # n_k × d
         K = [linear(x, state_dict[f'layer{li}.attn_wk']) for x in X]  # n_k × d
         V = [linear(x, state_dict[f'layer{li}.attn_wv']) for x in X]  # n_k × d
-        
-        X_attn = []
+        #print("Q"); print(Q); print("K"); print(K); print("V"); print(V);
+        X_attn = [[] for _ in range(n_k)]
         
         for h in range(n_head):
             hs = h * head_dim
@@ -151,14 +152,16 @@ def gpt(tokens, token_positions):
             # A_h = softmax(Q_h @ K_h^T / sqrt(d_h))
             # Dot product: Q_h · K_t^T with scaling
             attn_logits = [[sum(Q_h[i][j] * K_h[t][j] for j in range(head_dim)) / (head_dim ** 0.5) for t in range(n_k)] for i in range(n_k)]
+            # Apply softmax to get attention weights
             for i in range(n_k):
                 for j in range(i+1,n_k):
-                   attn_logits[i][j] = -1e9 # Masking Step
-            # Apply softmax to get attention weights
+                    attn_logits[i][j] = Value(-1e9)
             attn_weights = [softmax(attn_logits[i]) for i in range(n_k)]
-                
+            #print("Attn_Weights"); print(attn_weights);
             # Compute per-head output (Equation 12): O_h = A_h @ V_h
             head_out = [[sum(attn_weights[i][t] * V_h[t][j] for t in range(n_k)) for j in range(head_dim)] for i in range(n_k)]
+            #print("head_out"); print(head_out);
+            # print("Head_out", n_k, len(head_out))
             for i in range(n_k):
                 X_attn[i].extend(head_out[i])
         
@@ -186,7 +189,7 @@ v = [0.0] * len(params) # second moment buffer
 # Repeat in sequence
 num_steps = 1000 # number of training steps
 for step in range(num_steps):
-
+    #print("Step:-", step);
     # Take single document, tokenize it, surround it with BOS special token on both sides
     doc = docs[step % len(docs)]
     tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
@@ -194,11 +197,11 @@ for step in range(num_steps):
 
     # Forward the token sequence through the model, building up the computation graph all the way to the loss
     losses = []
-    logits = gpt(tokens, list(range(n+1)
+    logits = gpt(tokens, list(range(n+1)))
     for i in range(n):
         target_id = tokens[i+1]
 
-        probs = softmax(logits[i+1])
+        probs = softmax(logits[i])
         loss_t = -probs[target_id].log()
         losses.append(loss_t)
     loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
@@ -224,11 +227,13 @@ print("\n--- inference (new, hallucinated names) ---")
 for sample_idx in range(20):
     token_id = BOS
     sample = []
+    input_tokens = []
+    input_positions = []
     for pos_id in range(block_size):
-        input_tokens = [token_id]
-        input_positions = [pos_id]
+        input_tokens.append(token_id)
+        input_positions.append(pos_id)
         logits = gpt(input_tokens, input_positions)
-        probs = softmax([l / temperature for l in logits])
+        probs = softmax([l / temperature for l in logits[pos_id]])
         token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
         if token_id == BOS:
             break
