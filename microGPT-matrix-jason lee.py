@@ -83,7 +83,8 @@ class Value:
 # Initialize the parameters, to store the knowledge of the model
 n_layer = 1     # depth of the transformer neural network (number of layers)
 n_embd = 16     # width of the network (embedding dimension)
-block_size = 30 # maximum context length of the attention window (note: the longest name is 15 characters)
+block_size = 121 # maximum context length of the attention window (note: the longest name is 15 characters)
+input_size = 20
 n_head = 4      # number of attention heads
 head_dim = n_embd // n_head # derived dimension of each head
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
@@ -198,31 +199,41 @@ v = [0.0] * len(params) # second moment buffer
 num_steps = 1000 # number of training steps
 Loss = 0
 
-train_list = [BOS]
+def conc(Data):
+    train_list = [BOS]
 
-for i in range(len(dataset)):
-    doc = dataset[i]
-    x,y = doc["Expression"].split('*')
-    z = doc["Result"]
-    x = int(x); y = int(y); z = int(z);
-    train_list += [x, 10000, y, 10001, z, BOS]   
+    print("chut",len(Data))
+    
+    for i in range(len(Data)):
+        doc = Data[i]
+        x,y = doc["Expression"].split('*')
+        z = doc["Result"]
+        x = int(x); y = int(y); z = int(z);
+        if(i == len(Data)-1):
+            train_list += [x, 10000, y, 10001]
+            test_list = train_list + [z]
+        else:
+            train_list += [x, 10000, y, 10001, z, BOS]
+    return train_list, test_list
 
 with mlflow.start_run():
     mlflow.log_param("learning_rate", learning_rate)
     mlflow.log_param("num_steps", num_steps)
     
     for step in tqdm(range(num_steps)):
-        #print("Step:-", step);
         # Take single document, tokenize it, surround it with BOS special token on both sides
-        start = random.randint(0, len(train_list)-block_size-1)
-        tokens = [train_list[j] for j in range(start, start+block_size)]
+        start = random.randint(0, len(dataset)-input_size-1)
+        tokens, target_ids = conc([dataset[j] for j in range(start,start+input_size)])
+        if(step == 0):
+            print("tokens",len(tokens), tokens, "\nTargets" , target_ids)
+        n = len(tokens)
             #print(len(tokens),"chut",tokens)
         # Forward the token sequence through the model, building up the computation graph all the way to the loss
         logits = gpt(tokens, list(range(len(tokens))))
-        target_id = train_list[start+block_size]
-        probs = softmax(logits[len(tokens)-1])
-        loss = -probs[target_id].log()
-    
+        probs = [softmax(logits[j]) for j in range(n)]
+        losses = [-probs[j][target_ids[j]].log() for j in range(n)]
+        loss = (1/n)*sum(losses)
+        
         # Backward the loss, calculating the gradients with respect to all model parameters
         loss.backward()
     
@@ -254,3 +265,4 @@ with mlflow.start_run():
         json.dump(state_dict_data, f)
     mlflow.log_artifact("Matrix-microGPT-2digit.json")
 #--------------------------------------------------------------------------------------------------------------------------------------------#
+    
