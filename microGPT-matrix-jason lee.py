@@ -1,9 +1,40 @@
-import dagshub
-dagshub.init(repo_owner='cs1251117', repo_name='Matrix-microgpt', mlflow=True)
-import mlflow
+import os       # os.path.exists
+from contextlib import nullcontext
 
-mlflow.set_tracking_uri("https://dagshub.com/cs1251117/Matrix-microgpt.mlflow")
-mlflow.set_experiment("2-digit-product-Matrix-simple")
+ENABLE_TRACKING = os.environ.get("ENABLE_TRACKING", "0") == "1"
+TRACKING_ENABLED = False
+
+class NullMLflow:
+    @staticmethod
+    def start_run():
+        return nullcontext()
+
+    @staticmethod
+    def log_param(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def log_metric(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def log_artifact(*args, **kwargs):
+        return None
+
+try:
+    if ENABLE_TRACKING:
+        import dagshub
+        import mlflow
+
+        dagshub.init(repo_owner='cs1251117', repo_name='Matrix-microgpt', mlflow=True)
+        mlflow.set_tracking_uri("https://dagshub.com/cs1251117/Matrix-microgpt.mlflow")
+        mlflow.set_experiment("2-digit-product-Matrix-simple")
+        TRACKING_ENABLED = True
+    else:
+        mlflow = NullMLflow()
+except ImportError:
+    mlflow = NullMLflow()
+    print("Tracking disabled because dagshub/mlflow is not installed.")
 
 """
 The most atomic way to train and run inference for a GPT in pure, dependency-free Python.
@@ -14,7 +45,6 @@ This implements the full attention matrix view as described in the transformer p
 Modified for matrix-based attention computation
 """
 
-import os       # os.path.exists
 import math     # math.log, math.exp
 from datasets import load_dataset
 from tqdm import tqdm
@@ -30,9 +60,12 @@ dataset = load_dataset("akash-deep321/Product-Arithmetic", split = "train")
 print(f"num docs: {len(dataset)}")
 
 # Let there be a Tokenizer to translate strings to sequences of integers ("tokens") and back
-uchars = sorted(set(range(10000))) + ['*','='] # unique characters in the dataset become token ids 0..n-1
-BOS = len(uchars) # token id for a special Beginning of Sequence (BOS) token
-vocab_size = len(uchars) + 1 # total number of unique tokens, +1 is for BOS
+NUM_TOKENS = 10000
+STAR = NUM_TOKENS
+EQUALS = STAR + 1
+MASK = EQUALS + 1
+BOS = MASK + 1
+vocab_size = BOS + 1
 print(f"vocab size: {vocab_size}")
 
 # Let there be Autograd to recursively apply the chain rule through a computation graph
@@ -83,8 +116,9 @@ class Value:
 # Initialize the parameters, to store the knowledge of the model
 n_layer = 1     # depth of the transformer neural network (number of layers)
 n_embd = 16     # width of the network (embedding dimension)
-block_size = 121 # maximum context length of the attention window (note: the longest name is 15 characters)
 input_size = 20
+block_size = input_size * 6  # [BOS, x, *, y, =, z] repeated for a 20-example window
+answer_reveal_prob = 0.5
 n_head = 4      # number of attention heads
 head_dim = n_embd // n_head # derived dimension of each head
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
@@ -199,40 +233,65 @@ v = [0.0] * len(params) # second moment buffer
 num_steps = 1000 # number of training steps
 Loss = 0
 
-def conc(Data):
-    train_list = [BOS]
+def encode_example(doc, reveal_answer=True):
+    left, right = doc["Expression"].split("*")
+    result = doc["Result"]
+    left = int(left)
+    right = int(right)
+    result = int(result)
+    visible_result = result if reveal_answer else MASK
+    input_chunk = [left, STAR, right, EQUALS, visible_result, BOS]
+    target_chunk = [left, STAR, right, EQUALS, result, BOS]
+    return input_chunk, target_chunk
 
-    print("chut",len(Data))
-    
-    for i in range(len(Data)):
-        doc = Data[i]
-        x,y = doc["Expression"].split('*')
-        z = doc["Result"]
-        x = int(x); y = int(y); z = int(z);
-        if(i == len(Data)-1):
-            train_list += [x, 10000, y, 10001]
-            test_list = train_list + [z]
-        else:
-            train_list += [x, 10000, y, 10001, z, BOS]
-    return train_list, test_list
+def sample_reveal_flags(window_size):
+    reveal_flags = [random.random() < answer_reveal_prob for _ in range(window_size)]
+    if window_size > 1:
+        if all(reveal_flags):
+            reveal_flags[random.randrange(window_size)] = False
+        elif not any(reveal_flags):
+            reveal_flags[random.randrange(window_size)] = True
+    return reveal_flags
+
+def encode_window(data):
+    reveal_flags = sample_reveal_flags(len(data))
+    visible_sequence = [BOS]
+    target_sequence = [BOS]
+    for doc, reveal_answer in zip(data, reveal_flags):
+        input_chunk, target_chunk = encode_example(doc, reveal_answer=reveal_answer)
+        visible_sequence.extend(input_chunk)
+        target_sequence.extend(target_chunk)
+    return visible_sequence[:-1], target_sequence[1:], reveal_flags
 
 with mlflow.start_run():
     mlflow.log_param("learning_rate", learning_rate)
     mlflow.log_param("num_steps", num_steps)
+    mlflow.log_param("block_size", block_size)
+    mlflow.log_param("input_size", input_size)
+    mlflow.log_param("answer_reveal_prob", answer_reveal_prob)
     
     for step in tqdm(range(num_steps)):
-        # Take single document, tokenize it, surround it with BOS special token on both sides
-        start = random.randint(0, len(dataset)-input_size-1)
-        tokens, target_ids = conc([dataset[j] for j in range(start,start+input_size)])
-        if(step == 0):
-            print("tokens",len(tokens), tokens, "\nTargets" , target_ids)
+        # Randomly take a 20-example window and train autoregressively over it.
+        start = random.randint(0, len(dataset) - input_size)
+        tokens, target_ids, reveal_flags = encode_window([dataset[j] for j in range(start, start + input_size)])
+        if step == 0:
+            hidden_answers = sum(1 for flag in reveal_flags if not flag)
+            print(
+                "tokens", len(tokens), tokens,
+                "\ntargets", len(target_ids), target_ids,
+                "\nrevealed", sum(reveal_flags),
+                "hidden", hidden_answers,
+            )
         n = len(tokens)
-            #print(len(tokens),"chut",tokens)
+
         # Forward the token sequence through the model, building up the computation graph all the way to the loss
-        logits = gpt(tokens, list(range(len(tokens))))
-        probs = [softmax(logits[j]) for j in range(n)]
-        losses = [-probs[j][target_ids[j]].log() for j in range(n)]
-        loss = (1/n)*sum(losses)
+        logits = gpt(tokens, list(range(n)))
+        losses = []
+        for pos_id in range(n):
+            probs = softmax(logits[pos_id])
+            target_id = target_ids[pos_id]
+            losses.append(-probs[target_id].log())
+        loss = (1 / n) * sum(losses)
         
         # Backward the loss, calculating the gradients with respect to all model parameters
         loss.backward()
