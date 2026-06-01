@@ -1,6 +1,41 @@
 import os       # os.path.exists
+from contextlib import nullcontext
 
- 
+ENABLE_TRACKING = os.environ.get("ENABLE_TRACKING", "0") == "1"
+TRACKING_ENABLED = False
+
+class NullMLflow:
+    @staticmethod
+    def start_run():
+        return nullcontext()
+
+    @staticmethod
+    def log_param(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def log_metric(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def log_artifact(*args, **kwargs):
+        return None
+
+try:
+    if ENABLE_TRACKING:
+        import dagshub
+        import mlflow
+
+        dagshub.init(repo_owner='cs1251117', repo_name='Matrix-microgpt', mlflow=True)
+        mlflow.set_tracking_uri("https://dagshub.com/cs1251117/Matrix-microgpt.mlflow")
+        mlflow.set_experiment("2-digit-product-Matrix-simple")
+        TRACKING_ENABLED = True
+    else:
+        mlflow = NullMLflow()
+except ImportError:
+    mlflow = NullMLflow()
+    print("Tracking disabled because dagshub/mlflow is not installed.")
+
 
 """
 
@@ -28,6 +63,7 @@ backward() is O(ops) instead of O(individual scalars).
 
 """
 
+
  
 
 import time
@@ -50,11 +86,15 @@ import torch.distributed as dist
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
+import math     # math.log, math.exp
+
 from datasets import load_dataset
 
 from tqdm import tqdm
 
 random.seed(42) # Let there be order among chaos
+
 
 torch.manual_seed(42)
 
@@ -157,6 +197,99 @@ head_dim = n_embd // n_head
  
 
 # ── Model definition (nn.Module so DDP can sync gradients) ───────────────
+
+import sys
+sys.setrecursionlimit(50000)
+
+# Let there be a Dataset `docs`: list[str] of documents (e.g. a list of names)
+dataset = load_dataset("akash-deep321/Product-Arithmetic", split = "train")
+print(f"num docs: {len(dataset)}")
+
+# Let there be a Tokenizer to translate strings to sequences of integers ("tokens") and back
+NUM_TOKENS = 10000
+STAR = NUM_TOKENS
+EQUALS = STAR + 1
+MASK = EQUALS + 1
+BOS = MASK + 1
+vocab_size = BOS + 1
+print(f"vocab size: {vocab_size}")
+
+# Let there be Autograd to recursively apply the chain rule through a computation graph
+class Value:
+    __slots__ = ('data', 'grad', '_children', '_local_grads') # Python optimization for memory usage
+
+    def __init__(self, data, children=(), local_grads=()):
+        self.data = data                # scalar value of this node calculated during forward pass
+        self.grad = 0                   # derivative of the loss w.r.t. this node, calculated in backward pass
+        self._children = children       # children of this node in the computation graph
+        self._local_grads = local_grads # local derivative of this node w.r.t. its children
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data + other.data, (self, other), (1, 1))
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data * other.data, (self, other), (other.data, self.data))
+
+    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
+    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
+    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
+    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
+    def __neg__(self): return self * -1
+    def __radd__(self, other): return self + other
+    def __sub__(self, other): return self + (-other)
+    def __rsub__(self, other): return other + (-self)
+    def __rmul__(self, other): return self * other
+    def __truediv__(self, other): return self * other**-1
+    def __rtruediv__(self, other): return other * self**-1
+
+    def backward(self):
+        topo = []
+        visited = set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for child in v._children:
+                    build_topo(child)
+                topo.append(v)
+        build_topo(self)
+        self.grad = 1
+        for v in reversed(topo):
+            for child, local_grad in zip(v._children, v._local_grads):
+                child.grad += local_grad * v.grad
+
+# Initialize the parameters, to store the knowledge of the model
+n_layer = 1     # depth of the transformer neural network (number of layers)
+n_embd = 16     # width of the network (embedding dimension)
+input_size = 20
+block_size = input_size * 6  # [BOS, x, *, y, =, z] repeated for a 20-example window
+answer_reveal_prob = 0.5
+n_head = 4      # number of attention heads
+head_dim = n_embd // n_head # derived dimension of each head
+matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
+state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+for i in range(n_layer):
+    state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
+    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
+print(f"num params: {len(params)}")
+
+# Define the model architecture: a function mapping tokens and parameters to logits over what comes next
+# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
+def linear(x, w):
+    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+
+def softmax(logits):
+    max_val = max(val.data for val in logits)
+    exps = [(val - max_val).exp() for val in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
 
 def rmsnorm(x):
 
@@ -344,6 +477,7 @@ warmup_steps = 5_000
 
 Loss = 0
 
+
 loss_history = []       # (step, loss)
 
 batch_loss_history = [] # (batch, avg_loss)
@@ -501,6 +635,87 @@ for step in tqdm(range(num_steps), disable=not is_main):
             batch_loss_history.append(((step + 1) // LOG_EVERY, avg))
 
             tqdm.write(f"Step {step+1:6d}/{num_steps} | loss {avg:.4f} | lr {lr_t:.2e}")
+
+
+def encode_example(doc, reveal_answer=True):
+    left, right = doc["Expression"].split("*")
+    result = doc["Result"]
+    left = int(left)
+    right = int(right)
+    result = int(result)
+    visible_result = result if reveal_answer else MASK
+    input_chunk = [left, STAR, right, EQUALS, visible_result, BOS]
+    target_chunk = [left, STAR, right, EQUALS, result, BOS]
+    return input_chunk, target_chunk
+
+def sample_reveal_flags(window_size):
+    reveal_flags = [random.random() < answer_reveal_prob for _ in range(window_size)]
+    if window_size > 1:
+        if all(reveal_flags):
+            reveal_flags[random.randrange(window_size)] = False
+        elif not any(reveal_flags):
+            reveal_flags[random.randrange(window_size)] = True
+    return reveal_flags
+
+def encode_window(data):
+    reveal_flags = sample_reveal_flags(len(data))
+    visible_sequence = [BOS]
+    target_sequence = [BOS]
+    for doc, reveal_answer in zip(data, reveal_flags):
+        input_chunk, target_chunk = encode_example(doc, reveal_answer=reveal_answer)
+        visible_sequence.extend(input_chunk)
+        target_sequence.extend(target_chunk)
+    return visible_sequence[:-1], target_sequence[1:], reveal_flags
+
+with mlflow.start_run():
+    mlflow.log_param("learning_rate", learning_rate)
+    mlflow.log_param("num_steps", num_steps)
+    mlflow.log_param("block_size", block_size)
+    mlflow.log_param("input_size", input_size)
+    mlflow.log_param("answer_reveal_prob", answer_reveal_prob)
+    
+    for step in tqdm(range(num_steps)):
+        # Randomly take a 20-example window and train autoregressively over it.
+        start = random.randint(0, len(dataset) - input_size)
+        tokens, target_ids, reveal_flags = encode_window([dataset[j] for j in range(start, start + input_size)])
+        if step == 0:
+            hidden_answers = sum(1 for flag in reveal_flags if not flag)
+            print(
+                "tokens", len(tokens), tokens,
+                "\ntargets", len(target_ids), target_ids,
+                "\nrevealed", sum(reveal_flags),
+                "hidden", hidden_answers,
+            )
+        n = len(tokens)
+
+        # Forward the token sequence through the model, building up the computation graph all the way to the loss
+        logits = gpt(tokens, list(range(n)))
+        losses = []
+        for pos_id in range(n):
+            probs = softmax(logits[pos_id])
+            target_id = target_ids[pos_id]
+            losses.append(-probs[target_id].log())
+        loss = (1 / n) * sum(losses)
+        
+        # Backward the loss, calculating the gradients with respect to all model parameters
+        loss.backward()
+    
+        # Adam optimizer update: update the model parameters based on the corresponding gradients
+        lr_t = learning_rate * (1 - step / num_steps) # linear learning rate decay
+        for i, p in enumerate(params):
+            m[i] = beta1 * m[i] + (1 - beta1) * p.grad
+            v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
+            m_hat = m[i] / (1 - beta1 ** (step + 1))
+            v_hat = v[i] / (1 - beta2 ** (step + 1))
+            p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
+            p.grad = 0
+        Loss += loss.data
+
+        mlflow.log_metric("lr", lr_t, step=step)
+        mlflow.log_metric("loss", loss.data, step=step)
+        
+        if (step+1)%32 == 0:
+            tqdm.write(f"Batch {((step+1)//32):4d} / {((num_steps//32)+1):4d} | loss {(Loss/32):.4f}", end='\r')
 
             Loss = 0
 
